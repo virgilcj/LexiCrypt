@@ -13,7 +13,7 @@
    Given a raw shellcode file (e.g., a binary blob of machine code), LexiCrypt replaces each byte with a corresponding word from the 256-word dictionary. For example, if byte `0x41` corresponds to the word `"notepad"`, that byte is replaced with `"notepad"` in the encoded output.
 
 3. **Output Templates**:  
-   After encoding, LexiCrypt generates a code template that includes the encoded words and the dictionary. Depending on the chosen language template (e.g., `cpp`, `rust`, `csharp`, `go`, `wsh`), it produces a ready-to-compile (or run) snippet.
+   After encoding, LexiCrypt generates a code template that includes the encoded words and the dictionary. Depending on the chosen language template (e.g., `cpp`, `rust`, `csharp`, `go`, `wsh`, and `powershell`), it produces a ready-to-compile (or run) snippet.
    This snippet (TLDR basic CreateThread process injection):
    - Decodes the word-based shellcode back into a byte array at runtime.
    - Allocates executable memory.
