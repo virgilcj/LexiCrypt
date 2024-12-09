@@ -1,0 +1,17 @@
+[package]
+name = "wordlistencoder"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rand = "0.8.5"
+tempfile = "3.14.0"
+winres = "0.1.12"
+clap = { version = "4.1", features = ["derive"] }
+
+
+[profile.release]
+opt-level = "z"
+lto = true
+panic= "abort"
+strip = "symbols"
