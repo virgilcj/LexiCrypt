@@ -1,11 +1,9 @@
 # LexiCrypt
-
-**LexiCrypt** is a shellcode obfuscation and encoding tool that transforms raw shellcode bytes into a "lexicon" of words derived from file names in the windows system32 directory. The resulting encoded output can then be embedded into a code template in various programming languages (e.g., C++, Rust, C#, Go, VBScript/WScript). This approach can help disguise shellcode and potentially bypass naive detection mechanisms.
+**LexiCrypt** is a shellcode obfuscation and encoding tool that transforms raw shellcode bytes into a "lexicon" of words derived from file names in the windows system32 directory, the /usr/bin directory on linux, or use a randomly generated list at runtime. The resulting encoded output can then be embedded into a code template in various programming languages (e.g., C++, Rust, C#, Go, VBScript/WScript). This approach can help disguise shellcode and potentially bypass naive detection mechanisms.
 
 **Note:** *This tool is intended to be compiled and executed on Windows platforms only.* It relies heavily on Windows-specific directories. Plans to add linux support and feeding the tool a custom wordlist are on the to-do list.
 
 ## How It Works
-
 1. **Wordlist Generation**:  
    LexiCrypt scans a directory (by default `C:\Windows\System32`) to gather a large set of unique filenames (without extensions). From these filenames, it selects and shuffles 256 unique words. Each unique word maps to a single byte (`0x00` to `0xFF`).
 
@@ -19,17 +17,13 @@
    - Allocates executable memory.
    - Copies and executes the decoded shellcode via `VirtualAlloc` and `CreateThread` (on Windows).
 
-
-
 ## Features
-
 - **Multi-language templates**: Currently supports C++, Rust, C#, Go, and VBScript/WScript templates for output.
 - **Automated wordlist generation**: Dynamically generates a 256-word dictionary from system filenames.
 - **Verification step**: Automatically verifies that the encoded shellcode correctly decodes back to the original bytes.
 - **Evasion technique**: By representing shellcode bytes as words, it may help avoid straightforward signature-based detection.
 
 ## Requirements
-
 - **Rust Toolchain**:  
   You’ll need a Rust compiler and Cargo.
   
@@ -37,7 +31,6 @@
   LexiCrypt currently relies on Windows-specific APIs and directories.
 
 ## Installation
-
 1. **Clone the Repository**:  
 ```
  git clone https://github.com/<your-username>/LexiCrypt.git
@@ -51,7 +44,6 @@ cargo build --release
 This produces a binary in target/release/lexiCrypt.exe.
 
 ## Usage
-
 Basic command-line usage:
 
 ```
@@ -68,11 +60,12 @@ Arguments:
         csharp
         go
         wsh (VBScript/WScript)
+    -r, --random: Enables random wordlist generation. 
   ```
 Example:
 
 ```
-lexicrypt.exe -i shellcode.bin -o lexiloader.cpp -t cpp
+lexicrypt.exe -i shellcode.bin -o lexiloader.cpp -t cpp 
 ```
 
 This command reads shellcode.bin, generates a 256-word dictionary from C:\Windows\System32, encodes the shellcode, and produces decoded_shellcode.cpp, containing the encoded words and a decoder routine.
@@ -83,7 +76,7 @@ After running LexiCrypt, you’ll have a single source file in your chosen langu
 For example, if you chose cpp, you’ll get a .cpp file. You can then compile it:
 
 ```
-cl /EHsc lexiloader.cpp
+cl .\lexiloader.cpp /EHsc /Od /bigobj
 
 .\lexiloader.exe
 ```

